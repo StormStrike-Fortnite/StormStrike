@@ -18203,6 +18203,58 @@ Object.assign(DEFAULT_SAVE.settings, { gunStyle: 'smooth' });
 { const v = SETTINGS.find(t => t.id === 'video'); if (v) v.rows.push({ k: 'gunStyle', label: 'Gun models', seg: [['smooth', 'Smooth'], ['classic', 'Classic']], apply: () => { if (Match.active && typeof rebuildViewModel === 'function') rebuildViewModel(); } }); }
 
 /* =========================================================
+   MOVE YOUR PROGRESS — Settings > Progress. Progress is kept in the browser, for one web address only, so a
+   new link (or another phone or computer) starts empty. "Copy my progress" makes a code of everything saved here; pasting
+   that code into "Load progress" on the other link puts it all there (after a second tap, as it replaces what is there).
+   ========================================================= */
+const XFER = { armed: false };
+SETTINGS.push({ id: 'progress', name: 'Progress', rows: [] });
+function xferCode() { return 'STORM1-' + btoa(unescape(encodeURIComponent(JSON.stringify(Save.data)))); }
+function xferRead(code) {
+  const c = String(code || '').replace(/\s+/g, '');
+  if (!/^STORM1-/.test(c)) return null;
+  try { const d = JSON.parse(decodeURIComponent(escape(atob(c.slice(7))))); return d && typeof d === 'object' && d.loadout && d.settings ? d : null; } catch (e) { return null; }
+}
+(function () {
+  const st = document.createElement('style');
+  st.textContent = '#xfer{margin-top:4px;gap:10px}#xfer h3{margin:0;font:400 var(--fs-l)/1.1 var(--display);color:var(--mist)}'
+    + '#xfer p{margin:0;color:var(--haze);font:500 var(--fs-s)/1.4 var(--body);max-width:62ch}'
+    + '#xfer textarea{width:100%;box-sizing:border-box;min-height:64px;padding:10px 12px;background:var(--storm);border:1px solid var(--front);border-radius:var(--r);color:var(--mist);font:500 13px/1.35 ui-monospace,Menlo,Consolas,monospace;resize:vertical;user-select:text;-webkit-user-select:text;word-break:break-all}'
+    + '#xfer textarea:focus{outline:2px solid var(--bolt);outline-offset:1px}'
+    + '#xfer .xfRow{display:flex;flex-wrap:wrap;gap:10px;align-items:center}#xfer .xfMsg{color:var(--surge);font-weight:700}';
+  document.head.appendChild(st);
+  const rs = UI.renderSettings;
+  UI.renderSettings = function () {
+    rs.apply(this, arguments);
+    if (this.settingsTab !== 'progress') return;
+    const body = $('stBody'); if (!body || $('xfer')) return;
+    XFER.armed = false;
+    const box = document.createElement('div'); box.id = 'xfer'; box.className = 'onBox';
+    box.innerHTML = '<h3>Move your progress</h3>'
+      + '<p>Your progress is kept in this browser, for this link only. To take it to a new link or another device, tap <b>Copy my progress</b> here, then paste the code into <b>Load progress</b> there.</p>'
+      + '<div class="xfRow"><button class="btn" id="xfCopy" type="button">Copy my progress</button><span class="xfMsg" id="xfCopied" hidden></span></div>'
+      + '<textarea id="xfOut" readonly hidden aria-label="Your progress code"></textarea>'
+      + '<textarea id="xfIn" spellcheck="false" autocomplete="off" placeholder="Paste a progress code here (it starts with STORM1-)" aria-label="Progress code to load"></textarea>'
+      + '<div class="xfRow"><button class="btn" id="xfLoad" type="button">Load progress</button><span class="xfMsg" id="xfMsg" role="alert"></span></div>';
+    body.appendChild(box);
+    const out = $('xfOut'), msg = $('xfMsg'), done = $('xfCopied');
+    $('xfCopy').onclick = () => {
+      Save.save(); const code = xferCode(); out.value = code; out.hidden = false;
+      const show = ok => { done.hidden = false; done.textContent = ok ? 'Copied. Now paste it on the other link.' : 'Select the code below and copy it.'; if (!ok) { out.focus(); out.select(); } };
+      try { copyText(code).then(show, () => show(false)); } catch (e) { show(false); }
+    };
+    $('xfIn').oninput = () => { XFER.armed = false; $('xfLoad').textContent = 'Load progress'; msg.textContent = ''; };
+    $('xfLoad').onclick = () => {
+      const d = xferRead($('xfIn').value);
+      if (!d) { msg.textContent = 'That is not a progress code. Copy the whole code, starting with STORM1-.'; return; }
+      if (!XFER.armed) { XFER.armed = true; $('xfLoad').textContent = 'Tap again to replace the progress here'; msg.textContent = 'Found progress at level ' + levelInfo(d.xp || 0).level + '. This replaces the progress on this link.'; return; }
+      try { localStorage.setItem(SAVE_KEY, JSON.stringify(d)); } catch (e) { msg.textContent = 'This browser would not save it. Private browsing can do that.'; return; }
+      msg.textContent = 'Loaded. Restarting…'; setTimeout(() => location.reload(), 300);
+    };
+  };
+})();
+
+/* =========================================================
    ITEMS — Shockwave grenade, launch pads, loot beams
    ========================================================= */
 const UP_Y = new V3(0, 1, 0);
@@ -19500,7 +19552,7 @@ SETTINGS.push({ id: 'touch', name: 'Touch', rows: [
     const on = Touch.on;
     // on a touch screen the touch tab comes second and the keyboard tab goes; mouse speed rows go too
     SETTINGS.length = 0;
-    const order = on ? ['game', 'touch', 'crosshair', 'video', 'audio', 'slots', 'pad'] : ALL.map(t => t.id);
+    const order = on ? ['game', 'touch', 'crosshair', 'video', 'audio', 'slots', 'pad', 'progress'] : ALL.map(t => t.id);
     for (const id of order) { const t = ALL.find(t => t.id === id); if (t) SETTINGS.push(t); }
     game.rows = on ? gameRows.filter(r => r.k !== 'sens' && r.k !== 'sensY').map(r => r.h === 'Mouse' ? { h: 'Aiming' } : r) : gameRows;
     video.rows = fullscreenOK() ? videoRows : videoRows.filter(r => !r.fullscreen);
@@ -19713,7 +19765,7 @@ function netConfig() {
   } catch (e) { }
   return Object.assign(c, window.STORMSTRIKE_NET || {});
 }
-const GAME_BUILD = '664687729d'; // build.js fills this in: two copies only match if they are the same build
+const GAME_BUILD = '00df55398d'; // build.js fills this in: two copies only match if they are the same build
 
 /* ---------------- INVITE CODES ----------------
    Easy to read out: a plain word and two digits, without the 0 and 1 that look like O and I. */
