@@ -19732,12 +19732,27 @@ const NET_CONFIG = {
   ice: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }],
   prefix: 'stormstrike-', maxPlayers: 2,
   serviceMs: 12000, connectMs: 20000, pingMs: 1000, troubleMs: 3000, dropMs: 12000, startGraceMs: 30000, // how long we wait for each thing
+  // when the two browsers can't link directly (phones on mobile data, most often), the game goes through a free public
+  // message server instead: each browser only talks to the server, which every network allows. No account is needed.
+  relays: ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'], relayAfterMs: 7000, relayMs: 9000, relayTopic: 'stormstrike/v1/',
 };
 // A relay for when the two networks won't let the browsers talk directly (phone data, some home routers and
 // school or work networks). It only carries the game when the direct way fails. This is Metered's free public
 // Open Relay: it takes a password made from a shared secret and a time, worked out here in the page.
 const NET_RELAY = { host: 'staticauth.openrelay.metered.ca', secret: 'openrelayprojectsecret' };
-let netRelayIce = null, netRelayEnd = 0, netRelayBusy = false;
+// your own free Metered relay (metered.ca, free plan): its app name and API key. When set, the game asks it for relay
+// passwords and uses those first; the shared one above stays as a back-up.
+const NET_METERED = { app: '', key: '' };
+let netRelayIce = null, netRelayEnd = 0, netRelayBusy = false, netOwnIce = null, netOwnEnd = 0, netOwnBusy = false;
+function netOwnPrep() {
+  const now = Date.now();
+  if (!NET_METERED.key || !NET_METERED.app || netOwnBusy || (netOwnIce && now < netOwnEnd) || !window.fetch) return;
+  netOwnBusy = true;
+  fetch('https://' + NET_METERED.app + '.metered.live/api/v1/turn/credentials?apiKey=' + encodeURIComponent(NET_METERED.key))
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(list => { if (Array.isArray(list) && list.length) { netOwnIce = list; netOwnEnd = Date.now() + 6 * 3600 * 1000; } netOwnBusy = false; })
+    .catch(() => { netOwnBusy = false; netOwnEnd = Date.now() + 60 * 1000; });
+}
 // the password lasts a day from when it is made, so a page left open longer than that makes a new one
 function netRelayPrep() {
   const now = Math.floor(Date.now() / 1000);
@@ -19756,16 +19771,16 @@ function netRelayPrep() {
 }
 // for testing: ?netHost=localhost:9000 on the address, or window.STORMSTRIKE_NET = {...} set before the game starts
 function netConfig() {
-  netRelayPrep();
+  netRelayPrep(); netOwnPrep();
   const c = Object.assign({}, NET_CONFIG);
-  c.ice = NET_CONFIG.ice.concat(netRelayIce || []);
+  c.ice = NET_CONFIG.ice.concat(netOwnIce || [], netRelayIce || []);
   try {
     const h = new URLSearchParams(location.search).get('netHost');
     if (h) { const [host, port] = h.split(':'); c.host = host; c.port = +port || 9000; c.secure = false; }
   } catch (e) { }
   return Object.assign(c, window.STORMSTRIKE_NET || {});
 }
-const GAME_BUILD = '00df55398d'; // build.js fills this in: two copies only match if they are the same build
+const GAME_BUILD = '7adcab035b'; // build.js fills this in: two copies only match if they are the same build
 
 /* ---------------- INVITE CODES ----------------
    Easy to read out: a plain word and two digits, without the 0 and 1 that look like O and I. */
@@ -19815,7 +19830,7 @@ const Net = {
     const c = netConfig(), attempt = n => {
       const code = this.pickCode(), p = this.peer = this.newPeer(c.prefix + code.toLowerCase());
       this.wait(c.serviceMs, 'service');
-      p.on('open', () => { if (this.peer !== p) return; this.clearWait(); this.code = code; this.retries = 0; this.emit('code', code); });
+      p.on('open', () => { if (this.peer !== p) return; this.clearWait(); this.code = code; this.retries = 0; this.relayListen(code); this.emit('code', code); });
       p.on('connection', conn => { if (this.peer === p) this.incoming(conn); });
       p.on('disconnected', () => { if (this.peer === p && !this.links.size) this.rejoinBroker(p); });
       p.on('error', e => {
@@ -19858,22 +19873,28 @@ const Net = {
   join(cb, code, hello) {
     if (!this.begin(cb, false)) return;
     const c = netConfig(), id = c.prefix + 'g' + Math.random().toString(36).slice(2, 12), p = this.peer = this.newPeer(id), target = c.prefix + code.toLowerCase();
-    this.code = code; this.wait(c.serviceMs, 'service');
+    this.code = code;
+    this.relayT = setTimeout(() => { if (this.peer === p && this.pid < 0) this.viaRelay(hello, 'service'); }, c.serviceMs); // the introducing service is down: try the message servers
     p.on('open', () => {
-      if (this.peer !== p) return;
+      if (this.peer !== p) return; clearTimeout(this.relayT);
       this.wait(c.connectMs, 'direct');
+      // no direct link soon: go through a message server instead (the code exists, so the host is there)
+      // (once the direct line is open it's only waiting for the host's answer, so it stays)
+      this.directOpen = false;
+      this.relayT = setTimeout(() => { if (this.peer === p && this.pid < 0 && !this.directOpen) this.viaRelay(hello, 'direct'); }, c.forceRelay ? 0 : c.relayAfterMs);
+      if (c.forceRelay) return; // tests: the message server only
       const conn = p.connect(target, { label: NET_LABEL.ev, reliable: true, serialization: 'json' });
       const link = { peerId: target, ev: conn, fast: null, heard: performance.now(), pingAt: 0, rtt: 0, pid: 0, name: '', look: null, bye: false };
-      conn.on('open', () => { if (this.peer !== p) return; link.heard = performance.now(); this.rawSend(link, Object.assign({ t: 'hello', build: this.build }, hello)); });
+      conn.on('open', () => { if (this.peer !== p) return; this.directOpen = true; link.heard = performance.now(); this.rawSend(link, Object.assign({ t: 'hello', build: this.build }, hello)); });
       conn.on('data', d => { if (this.pid < 0) this.joined(link, d, p, target); else this.recv(link, d, false); });
       conn.on('close', () => { if (this.pid >= 0) this.gone(link, 'left'); });
-      conn.on('error', e => { if (this.pid < 0 && e && e.type === 'negotiation-failed') this.fail('direct'); });
+      conn.on('error', e => { if (this.pid < 0 && e && e.type === 'negotiation-failed') this.viaRelay(hello, 'direct'); });
     });
     p.on('error', e => {
       if (this.peer !== p || this.pid >= 0) return;
       if (e.type === 'peer-unavailable') this.fail('notfound');
-      else if (e.type === 'negotiation-failed' || e.type === 'webrtc') this.fail('direct');
-      else if (NET_FATAL.has(e.type)) this.fail('service');
+      else if (e.type === 'negotiation-failed' || e.type === 'webrtc') this.viaRelay(hello, 'direct');
+      else if (NET_FATAL.has(e.type)) this.viaRelay(hello, 'service');
     });
   },
   joined(link, m, p, target) {
@@ -19882,7 +19903,7 @@ const Net = {
     if (m.t !== 'welcome') return;
     this.clearWait(); this.pid = m.pid; this.links.set(0, link); link.heard = performance.now();
     this.emit('welcome', link);
-    const f = p.connect(target, { label: NET_LABEL.fast, reliable: false, serialization: 'json' });
+    const f = link.mq ? netRelayConn(link.mq, link.to, NET_LABEL.fast, link.peerId, link.me) : p.connect(target, { label: NET_LABEL.fast, reliable: false, serialization: 'json' });
     link.fast = f; this.wireFast(link, f);
   },
 
@@ -19921,7 +19942,7 @@ const Net = {
         else if (d[0] === 'pn') { const r = performance.now() - d[1]; if (r >= 0 && r < 60000) { link.rtt = link.rtt ? link.rtt * 0.7 + r * 0.3 : r; this.rtt = link.rtt; } }
         else Online.fastMsg(link.pid, d);
       } else if (d && d.t === 'bye') { link.bye = true; this.gone(link, 'left'); }
-      else if (d && d.t) Online.msg(link.pid, d);
+      else if (d && d.t && d.t !== 'hello' && d.t !== 'welcome') Online.msg(link.pid, d); // (through a message server the hello may come more than once)
     } catch (e) { console.warn('Bad message from your friend', e); }
   },
   tick() {
@@ -19945,7 +19966,9 @@ const Net = {
   },
   // sends a goodbye if it can, and leaves. Safe to call at any time.
   leave() {
-    this.clearWait(); clearInterval(this.timer); this.timer = 0; this.lastTick = 0;
+    this.clearWait(); clearInterval(this.timer); this.timer = 0; this.lastTick = 0; clearTimeout(this.relayT); this.relayT = 0; this.relayTried = false;
+    const mqs = this.mqs; this.mqs = [];
+    if (mqs && mqs.length) setTimeout(() => { for (const m of mqs) m.close(); }, 200);
     if (!this.active) { this.cb = null; return; }
     this.active = false; this.cb = null; this.accepting = false; this.trouble = false; this.code = '';
     const p = this.peer; this.peer = null;
@@ -19955,6 +19978,144 @@ const Net = {
   },
 };
 function netName(n) { return String(n || '').replace(/[^\p{L}\p{N} _.'-]/gu, '').trim().slice(0, 16) || 'Player'; }
+
+/* =========================================================
+   RELAY — the way round when two browsers can't link directly (most often two phones on mobile data).
+   Both games then send their messages through a free public message server (MQTT, the kind smart-home gadgets use):
+   each browser only talks to the server, which every network allows, and the server passes the messages on.
+   No account. The host listens on every server in NET_CONFIG.relays; a friend who can't reach the host directly
+   tries them in turn. Messages go to a channel named after the game code.
+   Only game messages go through (moves, shots, builds, your player name) and they stop when you leave.
+   ========================================================= */
+// a small MQTT 3.1.1 client over a web socket: connect, subscribe, publish (no delivery guarantees beyond the socket's)
+class NetMq {
+  constructor(url, onMsg) { this.url = url; this.onMsg = onMsg; this.buf = new Uint8Array(0); this.pid = 1; this.wait = new Map(); this.ok = false; this.ws = null; this.ping = 0; }
+  static str(s) { const b = new TextEncoder().encode(s); return [b.length >> 8, b.length & 255, ...b]; }
+  static pack(type, body) {
+    const len = []; let n = body.length; do { let d = n % 128; n = Math.floor(n / 128); if (n) d |= 128; len.push(d); } while (n);
+    const out = new Uint8Array(1 + len.length + body.length); out[0] = type; out.set(len, 1); out.set(body, 1 + len.length); return out;
+  }
+  connect(ms) {
+    return new Promise((res, rej) => {
+      let ws; try { ws = this.ws = new WebSocket(this.url, 'mqtt'); } catch (e) { rej(e); return; }
+      ws.binaryType = 'arraybuffer';
+      const t = setTimeout(() => { rej(new Error('timeout')); this.close(); }, ms || 8000);
+      this.wait.set('conn', () => { clearTimeout(t); this.ok = true; res(this); });
+      ws.onopen = () => {
+        const id = 'ss' + Math.random().toString(36).slice(2, 12);
+        ws.send(NetMq.pack(0x10, [...NetMq.str('MQTT'), 4, 0x02, 0, 60, ...NetMq.str(id)]));
+        this.ping = setInterval(() => this.raw(NetMq.pack(0xc0, [])), 25000);
+      };
+      ws.onmessage = e => this.data(new Uint8Array(e.data));
+      ws.onerror = () => { };
+      ws.onclose = () => { clearTimeout(t); const was = this.ok; this.ok = false; clearInterval(this.ping); if (!was) rej(new Error('closed')); else if (this.onClose) this.onClose(); };
+    });
+  }
+  raw(b) { if (this.ws && this.ws.readyState === 1) try { this.ws.send(b); } catch (e) { } }
+  sub(topic) {
+    const id = this.pid++ & 0xffff;
+    return new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error('timeout')), 8000);
+      this.wait.set('sub' + id, () => { clearTimeout(t); res(); });
+      this.raw(NetMq.pack(0x82, [id >> 8, id & 255, ...NetMq.str(topic), 0]));
+    });
+  }
+  pub(topic, text) { this.raw(NetMq.pack(0x30, [...NetMq.str(topic), ...new TextEncoder().encode(text)])); }
+  // the server may send several packets at once, or one in pieces
+  data(chunk) {
+    const b = new Uint8Array(this.buf.length + chunk.length); b.set(this.buf); b.set(chunk, this.buf.length); this.buf = b;
+    for (;;) {
+      const B = this.buf; if (B.length < 2) return;
+      let len = 0, mul = 1, i = 1, d;
+      do { if (i >= B.length) return; d = B[i++]; len += (d & 127) * mul; mul *= 128; } while (d & 128 && i < 5);
+      if (B.length < i + len) return;
+      const type = B[0] >> 4, body = B.subarray(i, i + len); this.buf = B.slice(i + len);
+      if (type === 2) { if (body[1] === 0) { const f = this.wait.get('conn'); this.wait.delete('conn'); if (f) f(); } else this.close(); }
+      else if (type === 9) { const id = (body[0] << 8) | body[1], f = this.wait.get('sub' + id); this.wait.delete('sub' + id); if (f) f(); }
+      else if (type === 3) {
+        const qos = (B[0] >> 1) & 3, tl = (body[0] << 8) | body[1], topic = new TextDecoder().decode(body.subarray(2, 2 + tl));
+        const at = 2 + tl + (qos ? 2 : 0);
+        try { this.onMsg(topic, new TextDecoder().decode(body.subarray(at))); } catch (e) { }
+      }
+    }
+  }
+  close() { this.ok = false; clearInterval(this.ping); const ws = this.ws; this.ws = null; if (ws) { try { if (ws.readyState === 1) ws.send(NetMq.pack(0xe0, [])); ws.close(); } catch (e) { } } }
+}
+// looks like one of PeerJS's connections to the rest of the game (open, send, on, close)
+function netRelayConn(mq, to, label, peer, me) {
+  const h = {}, fast = label === NET_LABEL.fast;
+  const c = {
+    mq, to, label, peer, open: true, lastP: 0,
+    on(ev, fn) { (h[ev] = h[ev] || []).push(fn); return c; },
+    emit(ev, d) { for (const fn of h[ev] || []) fn(d); },
+    send(o) {
+      if (!c.open || !mq.ok) return;
+      // a server is slower than a direct line: positions go about 15 times a second (the game smooths between them)
+      if (fast && Array.isArray(o) && o[0] === 'p') { const now = performance.now(); if (now - c.lastP < 60) return; c.lastP = now; }
+      mq.pub(to, JSON.stringify({ f: me, c: fast ? 1 : 0, d: o }));
+    },
+    close() { if (!c.open) return; c.open = false; c.emit('close'); },
+  };
+  return c;
+}
+Object.assign(Net, {
+  mqs: [],
+  // the host listens on every server, so a friend who can't come directly can still find the game
+  relayListen(code) {
+    const c = netConfig(); if (!c.relays || !c.relays.length || !window.WebSocket) return;
+    const top = c.relayTopic + code.toLowerCase(), conns = new Map();
+    for (const url of c.relays) {
+      const mq = new NetMq(url, (topic, text) => {
+        if (!this.active || !this.isHost) return;
+        let m; try { m = JSON.parse(text); } catch (e) { return; }
+        if (!m || typeof m.f !== 'string' || m.f === 'h') return;
+        const key = url + '|' + m.f + '|' + (m.c ? 1 : 0); let conn = conns.get(key);
+        if (!conn) {
+          conn = netRelayConn(mq, top + '/g/' + m.f, m.c ? NET_LABEL.fast : NET_LABEL.ev, 'mq-' + m.f, 'h');
+          conns.set(key, conn); this.incoming(conn);
+        }
+        conn.emit('data', m.d);
+      });
+      this.mqs.push(mq);
+      mq.connect(c.relayMs).then(() => mq.sub(top + '/h')).catch(() => { mq.close(); });
+    }
+  },
+  // a friend who couldn't link directly goes through the servers in turn until the host answers
+  viaRelay(hello, why) {
+    if (this.relayTried || this.pid >= 0 || !this.active) return;
+    this.relayTried = true; this.clearWait(); clearTimeout(this.relayT);
+    const c = netConfig(), code = this.code, top = c.relayTopic + code.toLowerCase(), me = Math.random().toString(36).slice(2, 12);
+    const p = this.peer; this.peer = null; if (p) setTimeout(() => { try { p.destroy(); } catch (e) { } }, 50);
+    const urls = (c.relays || []).slice();
+    if (!urls.length || !window.WebSocket) { this.fail(why); return; }
+    const next = () => {
+      if (!this.active || this.pid >= 0) return;
+      const url = urls.shift(); if (!url) { this.fail(why); return; }
+      let link = null;
+      const mq = new NetMq(url, (topic, text) => {
+        if (!link || !this.active) return;
+        let m; try { m = JSON.parse(text); } catch (e) { return; }
+        if (!m || m.f !== 'h') return;
+        if (this.pid < 0) { if (!m.c) this.joined(link, m.d, null, ''); }
+        else if (m.c) { if (link.fast) link.fast.emit('data', m.d); } else link.ev.emit('data', m.d);
+      });
+      this.mqs.push(mq);
+      const giveUp = setTimeout(() => { if (this.pid < 0 && this.active) { mq.close(); next(); } }, c.relayMs + 4000);
+      mq.connect(c.relayMs).then(() => mq.sub(top + '/g/' + me)).then(() => {
+        if (!this.active || this.pid >= 0) { clearTimeout(giveUp); return; }
+        const ev = netRelayConn(mq, top + '/h', NET_LABEL.ev, 'mq-host', me);
+        link = { peerId: 'mq-host', ev, fast: null, heard: performance.now(), pingAt: 0, rtt: 0, pid: 0, name: '', look: null, bye: false, mq, to: top + '/h', me };
+        ev.on('data', d => this.recv(link, d, false));
+        ev.on('close', () => { if (this.pid >= 0) this.gone(link, 'left'); });
+        mq.onClose = () => { if (this.pid >= 0 && this.links.get(0) === link) this.gone(link, 'lost'); };
+        // the host may be slow to hear: say hello again until it answers
+        const say = () => { if (this.active && this.pid < 0 && link) { this.rawSend(link, Object.assign({ t: 'hello', build: this.build }, hello)); setTimeout(say, 1500); } else clearTimeout(giveUp); };
+        say();
+      }).catch(() => { clearTimeout(giveUp); mq.close(); next(); });
+    };
+    next();
+  },
+});
 
 /* =========================================================
    ONLINE 1V1 — the normal 1v1 mode with a friend in the bot's place
@@ -20414,7 +20575,7 @@ UI.renderOnline = function () {
   const show = UI.show;
   UI.show = function (id, retTo) {
     const was = this.cur; show.call(this, id, retTo);
-    if (id === 'onlineMenu') { netRelayPrep(); this.renderOnline(); }
+    if (id === 'onlineMenu') { netRelayPrep(); netOwnPrep(); this.renderOnline(); }
     else if (was === 'onlineMenu' && id && Net.active && !Online.on) { Net.leave(); Lobby.view = 'home'; Lobby.msg = ''; }
   };
   // the mode screen gets one more choice
