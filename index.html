@@ -11990,6 +11990,149 @@ function shownInScene(o) { for (; o; o = o.parent) { if (!o.visible) return fals
 const _shadowLayers = new THREE.Layers(); _shadowLayers.set(SHADOW_LAYER);
 
 /* =========================================================
+   VIEW CULLING — only what you can see is drawn.
+   This three.js draws an instanced mesh whole, every frame, unless told otherwise: the island's trees, rocks, bushes and
+   props (one mesh each, spread over the whole map) were all drawn even behind you and past the fog.
+   1. Meshes already split into areas (grass patches, the outer ring, the big map) were given a sphere round their area,
+      but never told to use it: they now are, so an area off screen is skipped.
+   2. The other big instanced meshes are drawn through a stand-in that holds just the instances in view (with a margin,
+      so turning doesn't show gaps) and nearer than the fog's end (fog fades to the horizon there, so nothing is lost).
+      The stand-in is rebuilt when the camera has moved or turned a little, or the instances change. The mesh itself
+      stays as it is (props, shadows and everything else still use it); it is only kept out of the picture.
+   ========================================================= */
+const VIEW_HIDDEN_LAYER = 2;
+const ViewCull = {
+  list: [], areas: [], seen: new WeakSet(), cam: { x: 1e9, y: 1e9, z: 1e9, fx: 0, fy: 0, fz: 0, fov: 0, asp: 0, far: 0 },
+  frustum: new THREE.Frustum(), pm: new THREE.Matrix4(), off: false,
+  margin: Math.sin(12 * Math.PI / 180), // how far outside the view an instance may be and still be kept (about 12 degrees)
+  skip(o) {
+    if (!o.isInstancedMesh || this.seen.has(o) || o.userData.noShadowProxy || o.userData.viewProxy || o.userData.noViewCull) return true;
+    if (ChestDraw.parts && Object.values(ChestDraw.parts).includes(o)) return true; // a handful near you, rebuilt every frame anyway
+    for (const k in o.geometry.attributes) if (o.geometry.attributes[k].isInstancedBufferAttribute) return true; // its own per-instance data (effects)
+    return false;
+  },
+  scan(root) {
+    root.traverse(o => {
+      if (this.skip(o)) return;
+      const g = o.geometry, bs = g.boundingSphere;
+      // an area mesh (its sphere covers the area; one worked out from a single object sits at the origin)
+      const area = bs && bs.radius > 15 && Math.hypot(bs.center.x, bs.center.z) > 1;
+      // a few hundred instances or fewer, not casting its own shadow: instance by instance. Otherwise, if it is an area mesh,
+      // the usual check on the area's sphere (grass patches hold too many tufts to look at one by one)
+      if (o.instanceMatrix.count < 16 || o.instanceMatrix.count > 800 || o.castShadow) { if (area) { this.seen.add(o); this.fitArea(o); o.frustumCulled = true; this.areas.push(o); } return; }
+      this.seen.add(o);
+      // one instance's own sphere (an area mesh's geometry carries the area's)
+      const box = new THREE.Box3().setFromBufferAttribute(g.attributes.position), sph = new THREE.Sphere(); box.getBoundingSphere(sph);
+      const cap = o.instanceMatrix.count, v = new THREE.InstancedMesh(g, o.material, cap);
+      if (o.instanceColor) v.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3).fill(1), 3);
+      v.count = 0; v.frustumCulled = false; v.castShadow = false; v.receiveShadow = o.receiveShadow; v.renderOrder = o.renderOrder;
+      v.instanceMatrix.setUsage(THREE.DynamicDrawUsage); if (v.instanceColor) v.instanceColor.setUsage(THREE.DynamicDrawUsage);
+      v.userData.viewProxy = true; v.userData.noShadowProxy = true; v.matrixAutoUpdate = false;
+      o.layers.set(VIEW_HIDDEN_LAYER); // the picture comes from the stand-in
+      this.list.push({ src: o, view: v, c: sph.center, r: sph.radius, ver: -1, cver: -1, n: -1, dirty: true });
+    });
+  },
+  // an area's sphere is widened, if need be, to hold every instance it has (a patch on a steep hill can poke out of it)
+  fitArea(o) {
+    const g = o.geometry, A = o.instanceMatrix.array, n = o.count; if (!n) return;
+    const one = new THREE.Box3().setFromBufferAttribute(g.attributes.position), s1 = new THREE.Sphere(); one.getBoundingSphere(s1);
+    const box = new THREE.Box3(), v = new V3();
+    for (let i = 0; i < n; i++) {
+      const k = i * 16, sc = Math.sqrt(Math.max(A[k] * A[k] + A[k + 1] * A[k + 1] + A[k + 2] * A[k + 2], A[k + 4] * A[k + 4] + A[k + 5] * A[k + 5] + A[k + 6] * A[k + 6], A[k + 8] * A[k + 8] + A[k + 9] * A[k + 9] + A[k + 10] * A[k + 10]));
+      const r = (s1.radius + s1.center.length()) * sc + 0.5; v.set(A[k + 12], A[k + 13], A[k + 14]);
+      box.expandByPoint(v.clone().addScalar(r)); box.expandByPoint(v.addScalar(-r));
+    }
+    const fit = new THREE.Sphere(); box.getBoundingSphere(fit);
+    const bs = g.boundingSphere; if (!bs.containsPoint(fit.center) || bs.center.distanceTo(fit.center) + fit.radius > bs.radius) g.boundingSphere = fit.union ? fit.union(bs) : fit;
+  },
+  // before each picture: cam is the camera it is drawn from
+  update(cam) {
+    if (!this.list.length || this.off) return;
+    const C = this.cam, p = cam.position, fog = scene.fog, far = fog && fog.far ? Math.min(fog.far, cam.far) : cam.far;
+    cam.updateMatrixWorld(); const e = cam.matrixWorld.elements, fx = -e[8], fy = -e[9], fz = -e[10];
+    const turned = fx * C.fx + fy * C.fy + fz * C.fz < 0.995, moved = Math.abs(p.x - C.x) > 2 || Math.abs(p.y - C.y) > 2 || Math.abs(p.z - C.z) > 2;
+    const all = turned || moved || cam.fov !== C.fov || cam.aspect !== C.asp || far !== C.far;
+    if (all) {
+      C.x = p.x; C.y = p.y; C.z = p.z; C.fx = fx; C.fy = fy; C.fz = fz; C.fov = cam.fov; C.asp = cam.aspect; C.far = far;
+      this.frustum.setFromProjectionMatrix(this.pm.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
+    }
+    const planes = this.frustum.planes, mg = this.margin;
+    for (const it of this.list) {
+      const s = it.src, v = it.view;
+      if (v.parent !== s.parent) { if (v.parent) v.parent.remove(v); if (s.parent) s.parent.add(v); }
+      v.visible = s.visible && v.count > 0; // an empty one would still cost a draw call
+      if (!s.parent || !s.visible) continue;
+      const cv = s.instanceColor ? s.instanceColor.version : 0;
+      if (!all && it.ver === s.instanceMatrix.version && it.cver === cv && it.n === s.count) continue;
+      it.ver = s.instanceMatrix.version; it.cver = cv; it.n = s.count;
+      v.matrix.copy(s.matrix); v.matrixWorld.copy(s.matrixWorld);
+      const A = s.instanceMatrix.array, B = v.instanceMatrix.array, AC = s.instanceColor && s.instanceColor.array, BC = v.instanceColor && v.instanceColor.array;
+      const W = s.matrixWorld.elements, gc = it.c, gr = it.r, n = s.count; let m = 0;
+      for (let i = 0; i < n; i++) {
+        const o = i * 16;
+        // the instance's sphere in the world
+        const lx = A[o] * gc.x + A[o + 4] * gc.y + A[o + 8] * gc.z + A[o + 12], ly = A[o + 1] * gc.x + A[o + 5] * gc.y + A[o + 9] * gc.z + A[o + 13], lz = A[o + 2] * gc.x + A[o + 6] * gc.y + A[o + 10] * gc.z + A[o + 14];
+        const x = W[0] * lx + W[4] * ly + W[8] * lz + W[12], y = W[1] * lx + W[5] * ly + W[9] * lz + W[13], z = W[2] * lx + W[6] * ly + W[10] * lz + W[14];
+        const sc = Math.sqrt(Math.max(A[o] * A[o] + A[o + 1] * A[o + 1] + A[o + 2] * A[o + 2], A[o + 4] * A[o + 4] + A[o + 5] * A[o + 5] + A[o + 6] * A[o + 6], A[o + 8] * A[o + 8] + A[o + 9] * A[o + 9] + A[o + 10] * A[o + 10]));
+        if (sc === 0) continue; // a broken prop (scaled to nothing)
+        const r = gr * sc, dx = x - C.x, dy = y - C.y, dz = z - C.z, d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d - r > C.far) continue; // past the fog: the horizon colour there anyway
+        const R = r + d * mg + 3; let inside = true; // with a margin, so a turn before the next rebuild shows no gap
+        for (let k = 0; k < 6; k++) { const pl = planes[k]; if (pl.normal.x * x + pl.normal.y * y + pl.normal.z * z + pl.constant < -R) { inside = false; break; } }
+        if (!inside) continue;
+        const q = m * 16; for (let k = 0; k < 16; k++) B[q + k] = A[o + k];
+        if (BC) { const a = i * 3, b = m * 3; if (AC) { BC[b] = AC[a]; BC[b + 1] = AC[a + 1]; BC[b + 2] = AC[a + 2]; } }
+        m++;
+      }
+      v.count = m;
+      if (m) { v.instanceMatrix.updateRange.offset = 0; v.instanceMatrix.updateRange.count = m * 16; v.instanceMatrix.needsUpdate = true;
+        if (v.instanceColor) { v.instanceColor.updateRange.offset = 0; v.instanceColor.updateRange.count = m * 3; v.instanceColor.needsUpdate = true; } }
+      v.visible = m > 0; // an empty one would still cost a draw call
+    }
+  },
+};
+(function () {
+  // new meshes come in where the shadow stand-ins look for them (the island at boot, the big map when it loads)
+  const sc = ShadowCasters.scan; ShadowCasters.scan = function (root) { const r = sc.apply(this, arguments); ViewCull.scan(root); return r; };
+  const rf = renderFrame; renderFrame = function () { ViewCull.update(camera); return rf.apply(this, arguments); };
+})();
+// The island's ground is one sheet of about 260,000 triangles, drawn whole. It is now drawn as tiles that share its
+// points and colours, so tiles off screen are skipped. The sheet itself stays (its shape is read elsewhere) but draws
+// nothing; the tiles are its children, so hiding it (another world) hides them too.
+function terrainTiles(T) {
+  const m = terrainMesh; if (!m || m.userData.tiles) return;
+  const g = m.geometry, idx = g.index, pos = g.attributes.position; if (!idx || !g.parameters) return;
+  const N = g.parameters.widthSegments, M = g.parameters.heightSegments; if (N !== M || N % T) return;
+  const A = idx.array, tiles = [], v = new V3();
+  for (let ty = 0; ty < N / T; ty++) for (let tx = 0; tx < N / T; tx++) {
+    const out = new (A.constructor)(T * T * 6); let o = 0, lo = new V3(1e9, 1e9, 1e9), hi = new V3(-1e9, -1e9, -1e9);
+    for (let iy = ty * T; iy < ty * T + T; iy++) {
+      const from = (iy * N + tx * T) * 6; out.set(A.subarray(from, from + T * 6), o); o += T * 6;
+    }
+    for (let i = 0; i < out.length; i++) { v.fromBufferAttribute(pos, out[i]); lo.min(v); hi.max(v); }
+    const tg = new THREE.BufferGeometry();
+    for (const k in g.attributes) tg.setAttribute(k, g.attributes[k]);
+    tg.setIndex(new THREE.BufferAttribute(out, 1));
+    tg.boundingSphere = new THREE.Sphere(lo.clone().add(hi).multiplyScalar(0.5), lo.distanceTo(hi) / 2);
+    tg.boundingBox = new THREE.Box3(lo.clone(), hi.clone());
+    const t = new THREE.Mesh(tg, m.material); t.receiveShadow = m.receiveShadow; t.castShadow = m.castShadow; t.renderOrder = m.renderOrder;
+    t.matrixAutoUpdate = false; m.add(t); tiles.push(t);
+  }
+  g.setDrawRange(0, 0); m.userData.tiles = tiles;
+}
+(function () {
+  const bt = buildTerrainMesh;
+  buildTerrainMesh = function () { const r = bt.apply(this, arguments); try { terrainTiles(60); } catch (e) { console.warn('ground tiles', e); } return r; };
+})();
+// for tests: the picture without any of this (every mesh whole, the ground in one piece), to compare against
+function viewCullOff(off) {
+  ViewCull.off = !!off;
+  for (const it of ViewCull.list) { if (off) it.src.layers.enable(0); else it.src.layers.set(VIEW_HIDDEN_LAYER); it.view.visible = false; it.n = -1; }
+  for (const o of ViewCull.areas) o.frustumCulled = !off;
+  const t = terrainMesh && terrainMesh.userData.tiles; if (t) { terrainMesh.geometry.setDrawRange(0, off ? Infinity : 0); for (const m of t) m.visible = !off; }
+}
+
+/* =========================================================
    SCENERY — far mountains round the horizon, and the picture's final polish
    Two rings of hazy mountains sit at the horizon and move with you, like the sky, so the island looks out over a
    range of peaks across the sea. They are drawn straight after the sky, behind everything, and take their haze from
@@ -19780,7 +19923,7 @@ function netConfig() {
   } catch (e) { }
   return Object.assign(c, window.STORMSTRIKE_NET || {});
 }
-const GAME_BUILD = '7adcab035b'; // build.js fills this in: two copies only match if they are the same build
+const GAME_BUILD = '12dbc24b55'; // build.js fills this in: two copies only match if they are the same build
 
 /* ---------------- INVITE CODES ----------------
    Easy to read out: a plain word and two digits, without the 0 and 1 that look like O and I. */
